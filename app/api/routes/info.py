@@ -7,6 +7,8 @@ import tempfile
 import uuid
 import requests
 from pathlib import Path
+import boto3
+from botocore.exceptions import ClientError
 
 router = APIRouter()
 
@@ -127,14 +129,57 @@ async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
         with open(output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
             dst.write(src.read())
 
-        # TODO: Upload the video to uploadthings and give uploadthing url in output_url
-
-        
-        # Return the URL to the processed video
-        return {
-            "status": "success",
-            "output_url": f"/output_videos/{output_filename}"
-        }
+        # After processing the video and saving to final_output_path
+        # Upload to S3
+        try:
+            # Initialize S3 client
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                region_name=os.getenv('AWS_REGION', 'us-east-1')
+            )
+            
+            # S3 bucket name and object key (path)
+            bucket_name = os.getenv('S3_BUCKET_NAME')
+            object_key = f"videos/{request.user_id}/{output_filename}"
+            
+            # Upload file to S3
+            s3_client.upload_file(
+                Filename=final_output_path,
+                Bucket=bucket_name,
+                Key=object_key,
+                ExtraArgs={
+                    'ContentType': 'video/mp4',
+                    # Optional: Set public read access
+                    'ACL': 'public-read'
+                }
+            )
+            
+            # Generate the URL for the uploaded file
+            if os.getenv('S3_USE_PRESIGNED_URL', 'false').lower() == 'true':
+                # Generate a presigned URL that expires after a certain time
+                expiration = int(os.getenv('S3_PRESIGNED_URL_EXPIRATION', '3600'))  # Default: 1 hour
+                s3_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': bucket_name, 'Key': object_key},
+                    ExpiresIn=expiration
+                )
+            else:
+                # Generate a public URL (if bucket is configured for public access)
+                s3_url = f"https://{bucket_name}.s3.{os.getenv('AWS_REGION', 'us-east-1')}.amazonaws.com/{object_key}"
+            
+            return {
+                "status": "success",
+                "output_url": s3_url
+            }
+            
+        except ClientError as e:
+            print(f"S3 upload error: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload video to S3: {str(e)}"
+            )
 
     except Exception as e:
         print(f"Error processing video: {str(e)}")
@@ -147,3 +192,6 @@ async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
         if 'temp_dir' in locals():
             import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
+        # Also remove the local output file after successful upload
+        if 'final_output_path' in locals() and os.path.exists(final_output_path):
+            os.remove(final_output_path)

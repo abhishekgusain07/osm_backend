@@ -126,6 +126,9 @@ async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
         final_output_path = os.path.join(output_dir, output_filename)
         with open(output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
             dst.write(src.read())
+
+        # TODO: Upload the video to uploadthings and give uploadthing url in output_url
+
         
         # Return the URL to the processed video
         return {

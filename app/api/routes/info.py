@@ -9,6 +9,9 @@ import requests
 from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 router = APIRouter()
 
@@ -47,9 +50,20 @@ async def health_check() -> Dict[str, Any]:
 @router.post("/stitch", response_model=StitchResponse, status_code=status.HTTP_200_OK)
 async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
     """
-    Endpoint to stitch multiple videos together with text overlay
+    Endpoint to stitch multiple videos together with text overlay and upload to Cloudflare R2
     """
     try:
+        # Debug: Print environment variables
+        print(f"R2_ENDPOINT_URL: {os.getenv('R2_ENDPOINT_URL')}")
+        print(f"R2_ACCESS_KEY_ID: {os.getenv('R2_ACCESS_KEY_ID')}")
+        print(f"R2_SECRET_ACCESS_KEY: {os.getenv('R2_SECRET_ACCESS_KEY', 'REDACTED')[:3]}...")
+        print(f"R2_BUCKET_NAME: {os.getenv('R2_BUCKET_NAME')}")
+        
+        # Debug: Print request data
+        print(f"video_urls: {request.video_urls}")
+        print(f"text_position: {request.text_position}")
+        print(f"hook_text: {request.hook_text}")
+        
         # Validate input
         if not request.video_urls:
             raise HTTPException(
@@ -70,7 +84,6 @@ async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
         video_url = request.video_urls[0]
         if video_url.startswith('/'):
             # For local development, prepend with your public directory path
-            # Adjust this path to match your project structure
             base_path = os.path.join(os.getcwd(), "../one-stop-marketing/public")
             input_video_path = os.path.join(base_path, video_url.lstrip('/'))
         else:
@@ -129,60 +142,66 @@ async def stitch_videos(request: StitchRequest) -> Dict[str, Any]:
         with open(output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
             dst.write(src.read())
 
-        # After processing the video and saving to final_output_path
-        # Upload to S3
+        # Upload to Cloudflare R2
         try:
-            # Initialize S3 client
-            s3_client = boto3.client(
+            # Debug: Before R2 client initialization
+            print("About to initialize R2 client")
+            
+            # Initialize R2 client using boto3 (S3-compatible API)
+            r2_client = boto3.client(
                 's3',
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-                region_name=os.getenv('AWS_REGION', 'us-east-1')
+                endpoint_url=os.getenv('R2_ENDPOINT_URL'),
+                aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+                region_name='auto'
             )
             
-            # S3 bucket name and object key (path)
-            bucket_name = os.getenv('S3_BUCKET_NAME')
+            # Debug: After R2 client initialization
+            print("R2 client initialized successfully")
+            
+            # R2 bucket name and object key (path)
+            bucket_name = os.getenv('R2_BUCKET_NAME')
             object_key = f"videos/{request.user_id}/{output_filename}"
             
-            # Upload file to S3
-            s3_client.upload_file(
+            # Upload file to R2
+            r2_client.upload_file(
                 Filename=final_output_path,
                 Bucket=bucket_name,
                 Key=object_key,
                 ExtraArgs={
                     'ContentType': 'video/mp4',
-                    # Optional: Set public read access
-                    'ACL': 'public-read'
                 }
             )
             
             # Generate the URL for the uploaded file
-            if os.getenv('S3_USE_PRESIGNED_URL', 'false').lower() == 'true':
-                # Generate a presigned URL that expires after a certain time
-                expiration = int(os.getenv('S3_PRESIGNED_URL_EXPIRATION', '3600'))  # Default: 1 hour
-                s3_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': bucket_name, 'Key': object_key},
-                    ExpiresIn=expiration
-                )
+            # For R2, we need to use the public URL format or a custom domain if configured
+            if os.getenv('R2_PUBLIC_URL'):
+                # If you have a custom domain or public bucket URL
+                r2_url = f"{os.getenv('R2_PUBLIC_URL').rstrip('/')}/{object_key}"
             else:
-                # Generate a public URL (if bucket is configured for public access)
-                s3_url = f"https://{bucket_name}.s3.{os.getenv('AWS_REGION', 'us-east-1')}.amazonaws.com/{object_key}"
+                # Default R2 public URL format (if public access is enabled)
+                r2_url = f"https://{bucket_name}.r2.dev/{object_key}"
+            
+            # Store video metadata in database
+            # TODO: Implement database storage for video metadata
             
             return {
                 "status": "success",
-                "output_url": s3_url
+                "output_url": r2_url
             }
             
         except ClientError as e:
-            print(f"S3 upload error: {str(e)}")
+            print(f"R2 upload error: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to upload video to S3: {str(e)}"
+                detail=f"Failed to upload video to Cloudflare R2: {str(e)}"
             )
 
     except Exception as e:
         print(f"Error processing video: {str(e)}")
+        # Print the full traceback for better debugging
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to stitch videos: {str(e)}"
